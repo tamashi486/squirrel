@@ -28,6 +28,19 @@ final class SquirrelInputController: IMKInputController {
   private var chordTimer: Timer?
   private var chordDuration: TimeInterval = 0
   private var currentApp: String = ""
+  // fit mode (frontend paging over Rime's full candidate list)
+  private struct PagingKey: Hashable {
+    let keycode: UInt32
+    let modifiers: UInt32
+  }
+  private static let modifierMask = kShiftMask.rawValue | kControlMask.rawValue | kAltMask.rawValue | kSuperMask.rawValue
+  private var pagingKeys: [PagingKey: (up: Bool, onlyWhenPaging: Bool)] = [:]
+  private var fitKey = ""
+  private var fitStart = 0
+  private var fitStack = [Int]()
+  private var fitVisible = 0
+  private var fitLastPage = true
+  private var fitSelectKeys = [Character]()
 
   // swiftlint:disable:next cyclomatic_complexity
   override func handle(_ event: NSEvent!, client sender: Any!) -> Bool {
@@ -113,7 +126,11 @@ final class SquirrelInputController: IMKInputController {
                                                            caps: modifiers.contains(.capsLock))
         if rimeKeycode != 0 {
           let rimeModifiers = SquirrelKeycode.osxModifiersToRime(modifiers: modifiers)
-          handled = processKey(rimeKeycode, modifiers: rimeModifiers)
+          if let consumed = fitHandleKey(rimeKeycode, modifiers: rimeModifiers) {
+            handled = consumed
+          } else {
+            handled = processKey(rimeKeycode, modifiers: rimeModifiers)
+          }
           rimeUpdate()
         }
       }
@@ -126,7 +143,9 @@ final class SquirrelInputController: IMKInputController {
   }
 
   func selectCandidate(_ index: Int) -> Bool {
-    let success = rimeAPI.select_candidate_on_current_page(session, index)
+    let success = fitActive
+      ? rimeAPI.select_candidate(session, fitStart + index)
+      : rimeAPI.select_candidate_on_current_page(session, index)
     if success {
       rimeUpdate()
     }
@@ -136,7 +155,7 @@ final class SquirrelInputController: IMKInputController {
   // swiftlint:disable:next identifier_name
   func page(up: Bool) -> Bool {
     var handled = false
-    handled = rimeAPI.change_page(session, up)
+    handled = fitActive ? fitPage(up: up) : rimeAPI.change_page(session, up)
     if handled {
       rimeUpdate()
     }
@@ -199,6 +218,7 @@ final class SquirrelInputController: IMKInputController {
   }
 
   override func hidePalettes() {
+    fitVisible = 0
     NSApp.squirrelAppDelegate.panel?.hide()
     super.hidePalettes()
   }
@@ -435,6 +455,7 @@ private extension SquirrelInputController {
       if let schema_id = status.schema_id, schemaId == "" || schemaId != String(cString: schema_id) {
         schemaId = String(cString: schema_id)
         NSApp.squirrelAppDelegate.loadSettings(for: schemaId)
+        loadPagingKeys()
         // inline preedit
         if let panel = NSApp.squirrelAppDelegate.panel {
           inlinePreedit = (panel.inlinePreedit && !rimeAPI.get_option(session, "no_inline")) || rimeAPI.get_option(session, "inline")
@@ -531,12 +552,43 @@ private extension SquirrelInputController {
         }
       }
       // swiftlint:enable identifier_name
-      let page = Int(ctx.menu.page_no)
-      let lastPage = ctx.menu.is_last_page
+      var page = Int(ctx.menu.page_no)
+      var lastPage = ctx.menu.is_last_page
+      var highlighted = Int(ctx.menu.highlighted_candidate_index)
+      if let panel = NSApp.squirrelAppDelegate.panel, panel.fitMode, numCandidates > 0 {
+        let selectKeys = ctx.menu.select_keys.map { Array(String(cString: $0)) } ?? Array("1234567890")
+        let cap = max(1, min(Int(ctx.menu.page_size), selectKeys.count))
+        let absolute = page * Int(ctx.menu.page_size) + highlighted
+        let key = "\(rimeAPI.get_input(session).map { String(cString: $0) } ?? "")|\(ctx.composition.sel_start)|\(ctx.composition.sel_end)"
+        if key != fitKey {
+          fitKey = key
+          fitStart = 0
+          fitStack = []
+        }
+        while absolute < fitStart {
+          fitStart = fitStack.popLast() ?? 0
+        }
+        var window = fitWindow(from: fitStart, cap: cap, labels: labels, panel: panel)
+        while window.count > 0 && absolute >= fitStart + window.count && !window.isLast {
+          fitStack.append(fitStart)
+          fitStart += window.count
+          window = fitWindow(from: fitStart, cap: cap, labels: labels, panel: panel)
+        }
+        candidates = window.candidates
+        comments = window.comments
+        highlighted = absolute - fitStart
+        page = fitStart > 0 ? 1 : 0
+        lastPage = window.isLast
+        fitVisible = window.count
+        fitLastPage = window.isLast
+        fitSelectKeys = selectKeys
+      } else {
+        fitVisible = 0
+      }
 
       let selRange = NSRange(location: start.utf16Offset(in: preedit), length: preedit.utf16.distance(from: start, to: end))
       showPanel(preedit: inlinePreedit ? "" : preedit, selRange: selRange, caretPos: caretPos.utf16Offset(in: preedit),
-                candidates: candidates, comments: comments, labels: labels, highlighted: Int(ctx.menu.highlighted_candidate_index),
+                candidates: candidates, comments: comments, labels: labels, highlighted: highlighted,
                 page: page, lastPage: lastPage)
       _ = rimeAPI.free_context(&ctx)
     } else {
@@ -587,6 +639,111 @@ private extension SquirrelInputController {
       panel.inputController = self
       panel.update(preedit: preedit, selRange: selRange, caretPos: caretPos, candidates: candidates, comments: comments, labels: labels,
                    highlighted: highlighted, page: page, lastPage: lastPage, update: true)
+    }
+  }
+}
+
+// MARK: - Fit mode: show as many candidates as fit in a fixed width, page in the frontend
+private extension SquirrelInputController {
+  var fitActive: Bool {
+    fitVisible > 0 && (NSApp.squirrelAppDelegate.panel?.fitMode ?? false)
+  }
+
+  // swiftlint:disable:next large_tuple
+  func fitWindow(from start: Int, cap: Int, labels: [String], panel: SquirrelPanel) -> (candidates: [String], comments: [String], count: Int, isLast: Bool) {
+    var candidates = [String]()
+    var comments = [String]()
+    var iterator = RimeCandidateListIterator()
+    if rimeAPI.candidate_list_from_index(session, &iterator, Int32(start)) {
+      while candidates.count <= cap && rimeAPI.candidate_list_next(&iterator) {
+        candidates.append(iterator.candidate.text.map { String(cString: $0) } ?? "")
+        comments.append(iterator.candidate.comment.map { String(cString: $0) } ?? "")
+      }
+      rimeAPI.candidate_list_end(&iterator)
+    }
+    let hasMore = candidates.count > cap
+    let fitting = panel.fitCount(candidates: Array(candidates.prefix(cap)), comments: Array(comments.prefix(cap)), labels: labels)
+    let count = max(min(fitting, candidates.count), candidates.isEmpty ? 0 : 1)
+    return (Array(candidates.prefix(count)), Array(comments.prefix(count)), count, !hasMore && count >= candidates.count)
+  }
+
+  func fitPage(up: Bool) -> Bool {
+    if up {
+      guard fitStart > 0 else { return true }
+      fitStart = fitStack.popLast() ?? 0
+    } else {
+      guard !fitLastPage else { return true }
+      fitStack.append(fitStart)
+      fitStart += fitVisible
+    }
+    _ = rimeAPI.highlight_candidate(session, fitStart)
+    return true
+  }
+
+  // Returns nil when the key should go to Rime as usual.
+  func fitHandleKey(_ keycode: UInt32, modifiers: UInt32) -> Bool? {
+    guard fitActive, modifiers & kReleaseMask.rawValue == 0 else { return nil }
+    let mods = modifiers & Self.modifierMask
+    if let binding = pagingKeys[PagingKey(keycode: keycode, modifiers: mods)],
+       !binding.onlyWhenPaging || fitStart > 0 {
+      return fitPage(up: binding.up)
+    }
+    if mods == 0, keycode < 0x80, let scalar = UnicodeScalar(keycode),
+       let position = fitSelectKeys.firstIndex(of: Character(scalar)) {
+      if position < fitVisible {
+        _ = rimeAPI.select_candidate(session, fitStart + position)
+      }
+      return true
+    }
+    return nil
+  }
+
+  static func keycode(named name: String) -> UInt32? {
+    let table: [String: Int32] = [
+      "comma": XK_comma, "period": XK_period, "minus": XK_minus, "equal": XK_equal,
+      "bracketleft": XK_bracketleft, "bracketright": XK_bracketright, "semicolon": XK_semicolon,
+      "apostrophe": XK_apostrophe, "slash": XK_slash, "backslash": XK_backslash, "grave": XK_grave,
+      "space": XK_space, "Tab": XK_Tab, "ISO_Left_Tab": XK_ISO_Left_Tab,
+      "Page_Up": XK_Page_Up, "Page_Down": XK_Page_Down, "Prior": XK_Prior, "Next": XK_Next,
+      "Left": XK_Left, "Right": XK_Right, "Up": XK_Up, "Down": XK_Down
+    ]
+    if let code = table[name] { return UInt32(code) }
+    if name.count == 1, let scalar = name.unicodeScalars.first, scalar.isASCII { return scalar.value }
+    return nil
+  }
+
+  // Collect the keys that page the menu: Page_Up/Page_Down, plus key_binder redirects to them.
+  func loadPagingKeys() {
+    pagingKeys = [:]
+    let pageUp = UInt32(XK_Page_Up)
+    let pageDown = UInt32(XK_Page_Down)
+    pagingKeys[PagingKey(keycode: pageUp, modifiers: 0)] = (true, false)
+    pagingKeys[PagingKey(keycode: pageDown, modifiers: 0)] = (false, false)
+    var config = RimeConfig()
+    guard rimeAPI.schema_open(schemaId, &config) else { return }
+    defer { _ = rimeAPI.config_close(&config) }
+    let count = rimeAPI.config_list_size(&config, "key_binder/bindings")
+    for i in 0..<count {
+      let prefix = "key_binder/bindings/@\(i)"
+      guard let send = rimeAPI.config_get_cstring(&config, "\(prefix)/send").map({ String(cString: $0) }),
+            send == "Page_Up" || send == "Page_Down",
+            let accept = rimeAPI.config_get_cstring(&config, "\(prefix)/accept").map({ String(cString: $0) }) else { continue }
+      let when = rimeAPI.config_get_cstring(&config, "\(prefix)/when").map { String(cString: $0) } ?? ""
+      guard ["paging", "has_menu", "composing", "always"].contains(when) else { continue }
+      var parts = accept.split(separator: "+").map(String.init)
+      guard let keyName = parts.popLast() else { continue }
+      guard let keycode = Self.keycode(named: keyName) else { continue }
+      var mods: UInt32 = 0
+      for part in parts {
+        switch part {
+        case "Shift": mods |= kShiftMask.rawValue
+        case "Control": mods |= kControlMask.rawValue
+        case "Alt": mods |= kAltMask.rawValue
+        case "Super": mods |= kSuperMask.rawValue
+        default: break
+        }
+      }
+      pagingKeys[PagingKey(keycode: keycode, modifiers: mods)] = (send == "Page_Up", when == "paging")
     }
   }
 }

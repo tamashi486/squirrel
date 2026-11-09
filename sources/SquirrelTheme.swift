@@ -66,6 +66,38 @@ final class SquirrelTheme {
   private(set) var inlinePreedit = false
   private(set) var inlineCandidate = false
   private(set) var showPaging = false
+  // Native-style capsule panel (fork option): padding no longer grows with corner radius,
+  // corners are clamped to half height, highlight is a pill inset by `hilitedInset`.
+  private(set) var capsule = false
+  private(set) var hilitedInset: CGFloat = 3
+  // Vibrancy material behind a translucent panel (fork option)
+  private(set) var material: NSVisualEffectView.Material = .hudWindow
+  static func material(named name: String) -> NSVisualEffectView.Material? {
+    switch name.lowercased() {
+    case "hud", "hudwindow": .hudWindow
+    case "menu": .menu
+    case "popover": .popover
+    case "sidebar": .sidebar
+    case "sheet": .sheet
+    case "tooltip", "tool_tip": .toolTip
+    case "header", "headerview": .headerView
+    case "titlebar": .titlebar
+    case "window", "windowbackground": .windowBackground
+    case "under_window", "underwindowbackground": .underWindowBackground
+    case "content", "contentbackground": .contentBackground
+    case "selection": .selection
+    default: nil
+    }
+  }
+  var capsuleMode: Bool { capsule && linear && !vertical }
+  // Fit mode (fork option): fixed-width horizontal bar showing as many candidates as fit
+  // within `maxWidth` points, like the macOS native IME. Paging is done by the frontend.
+  private(set) var maxWidth: CGFloat = 0
+  var fitMode: Bool { maxWidth > 0 && linear && !vertical }
+  // Status badge (fork option): show mode switches as a small accent-colored badge at the caret,
+  // like the macOS native IME, instead of in the candidate panel.
+  private(set) var statusBadge = false
+  private(set) var statusBadgeFontSize: CGFloat = 12
 
   private var fonts = [NSFont]()
   private var labelFonts = [NSFont]()
@@ -148,7 +180,7 @@ final class SquirrelTheme {
   private(set) lazy var firstParagraphStyle: NSParagraphStyle = {
     let style = NSParagraphStyle.default.mutableCopy() as! NSMutableParagraphStyle
     style.paragraphSpacing = linespace / 2
-    style.paragraphSpacingBefore = preeditLinespace / 2 + hilitedCornerRadius / 2
+    style.paragraphSpacingBefore = capsuleMode ? 0 : preeditLinespace / 2 + hilitedCornerRadius / 2
     return style as NSParagraphStyle
   }()
   private(set) lazy var paragraphStyle: NSParagraphStyle = {
@@ -159,11 +191,13 @@ final class SquirrelTheme {
   }()
   private(set) lazy var preeditParagraphStyle: NSParagraphStyle = {
     let style = NSMutableParagraphStyle.default.mutableCopy() as! NSMutableParagraphStyle
-    style.paragraphSpacing = preeditLinespace / 2 + hilitedCornerRadius / 2
+    style.paragraphSpacing = capsuleMode ? preeditLinespace : preeditLinespace / 2 + hilitedCornerRadius / 2
     style.lineSpacing = linespace
     return style as NSParagraphStyle
   }()
-  private(set) lazy var edgeInset: NSSize = if self.vertical {
+  private(set) lazy var edgeInset: NSSize = if self.capsuleMode {
+    NSSize(width: borderWidth, height: borderHeight)
+  } else if self.vertical {
     NSSize(width: borderHeight + cornerRadius, height: borderWidth + cornerRadius)
   } else {
     NSSize(width: borderWidth + cornerRadius, height: borderHeight + cornerRadius)
@@ -200,6 +234,12 @@ final class SquirrelTheme {
     mutualExclusive ?= config.getBool("style/mutual_exclusive")
     memorizeSize ?= config.getBool("style/memorize_size")
     showPaging ?= config.getBool("style/show_paging")
+    capsule ?= config.getBool("style/capsule")
+    hilitedInset ?= config.getDouble("style/hilited_inset").map { max(0, $0) }
+    material ?= config.getString("style/material").flatMap(Self.material(named:))
+    maxWidth ?= config.getDouble("style/max_width").map { max(0, $0) }
+    statusBadge ?= config.getBool("style/status_badge")
+    statusBadgeFontSize ?= config.getDouble("style/status_badge_font_point").map { max(6, $0) }
 
     statusMessageType ?= .init(rawValue: config.getString("style/status_message_type") ?? "")
     candidateFormat ?= config.getString("style/candidate_format")

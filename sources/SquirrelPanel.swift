@@ -10,6 +10,7 @@ import AppKit
 final class SquirrelPanel: NSPanel {
   private let view: SquirrelView
   private let back: NSVisualEffectView
+  private let badge = SquirrelBadge()
   var inputController: SquirrelInputController?
 
   var position: NSRect
@@ -65,6 +66,42 @@ final class SquirrelPanel: NSPanel {
   }
   var inlineCandidate: Bool {
     view.currentTheme.inlineCandidate
+  }
+  var fitMode: Bool {
+    view.currentTheme.fitMode
+  }
+
+  // Fit mode: how many of the leading candidates fit in the configured max width (at least 1).
+  func fitCount(candidates: [String], comments: [String], labels: [String]) -> Int {
+    let theme = view.currentTheme
+    guard !candidates.isEmpty else { return 0 }
+    let separator: CGFloat = if theme.capsuleMode {
+      2 * max(0, theme.borderWidth - theme.hilitedInset)
+    } else {
+      NSAttributedString(string: "  ", attributes: theme.attrs).size().width
+    }
+    var total: CGFloat = 0
+    var count = 0
+    for i in 0..<candidates.count {
+      let label = i < labels.count ? labels[i] : "\(i+1)"
+      let line = NSMutableAttributedString(string: theme.candidateFormat, attributes: theme.labelAttrs)
+      for range in line.string.ranges(of: /\[candidate\]/) {
+        line.addAttributes(theme.attrs, range: convert(range: range, in: line.string))
+      }
+      for range in line.string.ranges(of: /\[comment\]/) {
+        line.addAttributes(theme.commentAttrs, range: convert(range: range, in: line.string))
+      }
+      line.mutableString.replaceOccurrences(of: "[label]", with: label, range: NSRange(location: 0, length: line.length))
+      line.mutableString.replaceOccurrences(of: "[candidate]", with: candidates[i].precomposedStringWithCanonicalMapping, range: NSRange(location: 0, length: line.length))
+      line.mutableString.replaceOccurrences(of: "[comment]", with: i < comments.count ? comments[i].precomposedStringWithCanonicalMapping : "", range: NSRange(location: 0, length: line.length))
+      let width = ceil(line.size().width) + (count > 0 ? separator : 0)
+      if count > 0 && total + width > theme.maxWidth {
+        break
+      }
+      total += width
+      count += 1
+    }
+    return count
   }
 
   // swiftlint:disable:next cyclomatic_complexity
@@ -171,6 +208,7 @@ final class SquirrelPanel: NSPanel {
     cursorIndex = index
 
     if !candidates.isEmpty || !preedit.isEmpty {
+      badge.dismiss()
       statusMessage = ""
       statusTimer?.invalidate()
       statusTimer = nil
@@ -254,7 +292,16 @@ final class SquirrelPanel: NSPanel {
         line.addAttribute(.noBreak, value: true, range: NSRange(location: 1, length: line.length-1))
       }
 
-      let lineSeparator = NSAttributedString(string: linear ? "  " : "\n", attributes: attrs)
+      var lineSeparator = NSAttributedString(string: linear ? "  " : "\n", attributes: attrs)
+      if theme.capsuleMode {
+        // Widen/narrow the gap so every highlight pill gets the same inner padding
+        // as the panel edge: (border_width - hilited_inset) on each side.
+        let target = 2 * max(0, theme.borderWidth - theme.hilitedInset)
+        let natural = lineSeparator.boundingRect(with: .zero).width
+        var kerned = attrs
+        kerned[.kern] = (target - natural) / 2
+        lineSeparator = NSAttributedString(string: "  ", attributes: kerned)
+      }
       if i > 0 {
         text.append(lineSeparator)
       }
@@ -360,7 +407,11 @@ private extension SquirrelPanel {
     }
 
     // Break line if the text is too long, based on screen size.
-    let textWidth = maxTextWidth()
+    var textWidth = maxTextWidth()
+    if theme.fitMode {
+      // candidates were already trimmed to fit; leave slack so measuring rounding never wraps
+      textWidth = max(textWidth, theme.maxWidth + 40)
+    }
     let maxTextHeight = vertical ? screenRect.width - theme.edgeInset.width * 2 : screenRect.height - theme.edgeInset.height * 2
     view.textContainer.size = NSSize(width: textWidth, height: maxTextHeight)
 
@@ -395,7 +446,8 @@ private extension SquirrelPanel {
         panelRect.origin.x += preeditRect.height + theme.edgeInset.width
       }
     } else {
-      panelRect.size = NSSize(width: min(0.95 * screenRect.width, contentRect.width + theme.edgeInset.width * 2),
+      let contentWidth = theme.fitMode ? max(contentRect.width, theme.maxWidth) : contentRect.width
+      panelRect.size = NSSize(width: min(0.95 * screenRect.width, contentWidth + theme.edgeInset.width * 2),
                               height: min(0.95 * screenRect.height, contentRect.height + theme.edgeInset.height * 2))
       panelRect.size.width += theme.pagingOffset
       panelRect.origin = NSPoint(x: position.minX - theme.pagingOffset, y: position.minY - SquirrelTheme.offsetHeight - panelRect.height)
@@ -442,6 +494,7 @@ private extension SquirrelPanel {
       back.frame = contentView!.bounds
       back.frame.size.width += theme.pagingOffset
       back.appearance = NSApp.effectiveAppearance
+      back.material = theme.material
       back.isHidden = false
     } else {
       back.isHidden = true
@@ -454,6 +507,15 @@ private extension SquirrelPanel {
 
   func show(status message: String) {
     let theme = view.currentTheme
+    if theme.statusBadge {
+      currentScreen()
+      hide()
+      let text = message.applyingTransform(.fullwidthToHalfwidth, reverse: false) ?? message
+      badge.show(text, near: position, screen: screenRect,
+                 color: theme.highlightedBackColor ?? .controlAccentColor,
+                 fontSize: theme.statusBadgeFontSize, duration: SquirrelTheme.showStatusDuration)
+      return
+    }
     let text = NSMutableAttributedString(string: message, attributes: theme.attrs)
     text.addAttribute(.paragraphStyle, value: theme.paragraphStyle, range: NSRange(location: 0, length: text.length))
     view.textContentStorage.attributedString = text
@@ -472,5 +534,95 @@ private extension SquirrelPanel {
     let startPos = range.lowerBound.utf16Offset(in: string)
     let endPos = range.upperBound.utf16Offset(in: string)
     return NSRange(location: startPos, length: endPos - startPos)
+  }
+}
+
+// Small capsule badge shown at the caret for mode switches (中 / A), fading out by itself.
+final class SquirrelBadge: NSPanel {
+  private final class BadgeView: NSView {
+    var text = ""
+    var font = NSFont.systemFont(ofSize: 12, weight: .semibold)
+    var color = NSColor.controlAccentColor
+    var pill = NSRect.zero
+
+    override func draw(_ dirtyRect: NSRect) {
+      let path = NSBezierPath(roundedRect: pill, xRadius: pill.height / 2, yRadius: pill.height / 2)
+      NSGraphicsContext.saveGraphicsState()
+      let shadow = NSShadow()
+      shadow.shadowColor = NSColor.black.withAlphaComponent(0.22)
+      shadow.shadowBlurRadius = 3
+      shadow.shadowOffset = NSSize(width: 0, height: -1)
+      shadow.set()
+      color.setFill()
+      path.fill()
+      NSGraphicsContext.restoreGraphicsState()
+
+      // center the line box (ascender..descender) vertically, so CJK and Latin both sit in the middle
+      let style = NSMutableParagraphStyle()
+      style.alignment = .center
+      let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.white, .paragraphStyle: style]
+      let lineHeight = ceil(font.ascender - font.descender)
+      let textRect = NSRect(x: pill.minX, y: pill.midY - lineHeight / 2, width: pill.width, height: lineHeight)
+      NSAttributedString(string: text, attributes: attrs).draw(with: textRect, options: [.usesLineFragmentOrigin])
+    }
+  }
+
+  private static let margin: CGFloat = 6  // room for the soft shadow
+  private let badgeView = BadgeView()
+  private var timer: Timer?
+
+  init() {
+    super.init(contentRect: .zero, styleMask: [.nonactivatingPanel, .borderless], backing: .buffered, defer: true)
+    level = .init(Int(CGShieldingWindowLevel()))
+    hasShadow = false
+    isOpaque = false
+    backgroundColor = .clear
+    ignoresMouseEvents = true
+    contentView = badgeView
+  }
+
+  func show(_ text: String, near position: NSRect, screen: NSRect, color: NSColor, fontSize: CGFloat, duration: Double) {
+    let font = NSFont.systemFont(ofSize: fontSize, weight: .semibold)
+    let textWidth = NSAttributedString(string: text, attributes: [.font: font]).size().width
+    let height = ceil(fontSize * 1.6)
+    let width = max(ceil(height * 1.5), ceil(textWidth + fontSize * 1.4))
+    let margin = Self.margin
+    // pill centered under the caret, like the system input-mode indicator
+    var pillOrigin = NSPoint(x: position.minX - width / 2, y: position.minY - 4 - height)
+    if pillOrigin.y < screen.minY {
+      pillOrigin.y = position.maxY + 4
+    }
+    pillOrigin.x = min(max(pillOrigin.x, screen.minX), screen.maxX - width)
+    setFrame(NSRect(x: pillOrigin.x - margin, y: pillOrigin.y - margin, width: width + margin * 2, height: height + margin * 2), display: false)
+
+    badgeView.text = text
+    badgeView.font = font
+    badgeView.color = color
+    badgeView.pill = NSRect(x: margin, y: margin, width: width, height: height)
+    badgeView.needsDisplay = true
+
+    timer?.invalidate()
+    alphaValue = 1
+    orderFront(nil)
+    timer = Timer.scheduledTimer(withTimeInterval: duration, repeats: false) { [weak self] _ in
+      self?.fadeOut()
+    }
+  }
+
+  func dismiss() {
+    guard isVisible else { return }
+    timer?.invalidate()
+    timer = nil
+    orderOut(nil)
+  }
+
+  private func fadeOut() {
+    NSAnimationContext.runAnimationGroup({ context in
+      context.duration = 0.25
+      self.animator().alphaValue = 0
+    }, completionHandler: { [weak self] in
+      guard let self, self.alphaValue == 0 else { return }
+      self.orderOut(nil)
+    })
   }
 }

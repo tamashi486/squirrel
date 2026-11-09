@@ -165,13 +165,17 @@ final class SquirrelView: NSView {
       if i == hilightedIndex {
         // Draw highlighted Rect
         if candidate.length > 0 && theme.highlightedBackColor != nil {
-          highlightedPath = drawPath(highlightedRange: candidate, backgroundRect: backgroundRect, preeditRect: preeditRect, containingRect: containingRect, extraExpansion: 0)?.mutableCopy()
+          highlightedPath = (theme.capsuleMode
+            ? capsulePath(range: candidate, backgroundRect: backgroundRect)
+            : drawPath(highlightedRange: candidate, backgroundRect: backgroundRect, preeditRect: preeditRect, containingRect: containingRect, extraExpansion: 0))?.mutableCopy()
         }
       } else {
         // Draw other highlighted Rect
         if candidate.length > 0 && theme.candidateBackColor != nil {
-          let candidatePath = drawPath(highlightedRange: candidate, backgroundRect: backgroundRect, preeditRect: preeditRect,
-                                       containingRect: containingRect, extraExpansion: theme.surroundingExtraExpansion)
+          let candidatePath = theme.capsuleMode
+            ? capsulePath(range: candidate, backgroundRect: backgroundRect)
+            : drawPath(highlightedRange: candidate, backgroundRect: backgroundRect, preeditRect: preeditRect,
+                       containingRect: containingRect, extraExpansion: theme.surroundingExtraExpansion)
           if candidatePaths == nil {
             candidatePaths = CGMutablePath()
           }
@@ -217,7 +221,12 @@ final class SquirrelView: NSView {
     }
 
     NSBezierPath.defaultLineWidth = 0
-    backgroundPath = drawSmoothLines(rectVertex(of: backgroundRect), straightCorner: Set(), alpha: 0.3 * theme.cornerRadius, beta: 1.4 * theme.cornerRadius)
+    if theme.capsuleMode {
+      let radius = max(0, min(theme.cornerRadius, backgroundRect.height / 2, backgroundRect.width / 2))
+      backgroundPath = CGPath(roundedRect: backgroundRect, cornerWidth: radius, cornerHeight: radius, transform: nil)
+    } else {
+      backgroundPath = drawSmoothLines(rectVertex(of: backgroundRect), straightCorner: Set(), alpha: 0.3 * theme.cornerRadius, beta: 1.4 * theme.cornerRadius)
+    }
 
     self.layer?.sublayers = nil
     let backPath = backgroundPath?.mutableCopy()
@@ -250,9 +259,10 @@ final class SquirrelView: NSView {
       layer.mask = mask
       panelLayer.addSublayer(layer)
     }
-    if theme.borderLineWidth > 0, let color = theme.borderColor {
+    if theme.borderLineWidth > 0 || theme.capsuleMode, let color = theme.borderColor {
       let borderLayer = shapeFromPath(path: backgroundPath)
-      borderLayer.lineWidth = theme.borderLineWidth * 2
+      // capsule: hairline edge (half of the 1pt stroke is clipped by the panel mask)
+      borderLayer.lineWidth = theme.capsuleMode ? 1 : theme.borderLineWidth * 2
       borderLayer.strokeColor = color.cgColor
       borderLayer.fillColor = nil
       panelLayer.addSublayer(borderLayer)
@@ -715,6 +725,29 @@ private extension SquirrelView {
       resultingPath = nil
     }
     return resultingPath
+  }
+
+  // Capsule mode: one rounded rect per line segment of the candidate, padded by half the
+  // candidate separator horizontally and filling the line band vertically, kept
+  // `hilitedInset` away from the panel edge.
+  func capsulePath(range: NSRange, backgroundRect: NSRect) -> CGPath? {
+    guard let textRange = convert(range: range) else { return nil }
+    let theme = currentTheme
+    let bounds = backgroundRect.insetBy(dx: theme.hilitedInset, dy: theme.hilitedInset)
+    let padX = separatorWidth / 2
+    let padY = max(0, theme.edgeInset.height - theme.hilitedInset)
+    let path = CGMutablePath()
+    textLayoutManager.enumerateTextSegments(in: textRange, type: .selection, options: [.rangeNotRequired]) { _, rect, _, _ in
+      let segment = rect.offsetBy(dx: theme.edgeInset.width, dy: theme.edgeInset.height)
+        .insetBy(dx: -padX, dy: -padY)
+        .intersection(bounds)
+      if !nearEmpty(segment) {
+        let radius = max(0, min(theme.hilitedCornerRadius, segment.height / 2, segment.width / 2))
+        path.addPath(CGPath(roundedRect: segment, cornerWidth: radius, cornerHeight: radius, transform: nil))
+      }
+      return true
+    }
+    return path.isEmpty ? nil : path
   }
 
   func carveInset(rect: NSRect) -> NSRect {

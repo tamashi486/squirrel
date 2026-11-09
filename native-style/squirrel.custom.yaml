@@ -1,0 +1,68 @@
+# 鼠须管外观补丁：向 macOS 原生输入法靠拢
+# 注意：鼠须管颜色格式为 0xAABBGGRR（BGR 顺序）
+patch:
+  preset_color_schemes/native_light:
+    name: "原生 · 浅色"
+    back_color: 0x59FFFFFF            # 35% 白，叠在磨砂上，透出底色
+    border_color: 0x14000000          # 发丝描边（capsule 模式下只画 0.5pt 细线）
+    text_color: 0xB0433C3C
+    candidate_text_color: 0xFF1F1D1D
+    label_color: 0xFF938E8E
+    comment_text_color: 0xFF938E8E
+    hilited_candidate_back_color: 0xFFF6782F   # #2F78F6 原生选中蓝
+    hilited_candidate_text_color: 0xFFFFFFFF
+    hilited_candidate_label_color: 0xCCFFFFFF
+    hilited_comment_text_color: 0xFFFFE9D6
+    hilited_text_color: 0xFF1F1D1D
+
+  preset_color_schemes/native_dark:
+    name: "原生 · 深色"
+    back_color: 0x592D2B2B
+    border_color: 0x26FFFFFF
+    text_color: 0xB0F5EBEB
+    candidate_text_color: 0xFFF7F2F2
+    label_color: 0xFF9F9898
+    comment_text_color: 0xFF9F9898
+    hilited_candidate_back_color: 0xFFF6782F
+    hilited_candidate_text_color: 0xFFFFFFFF
+    hilited_candidate_label_color: 0xCCFFFFFF
+    hilited_comment_text_color: 0xFFFFE9D6
+    hilited_text_color: 0xFFF7F2F2
+
+  style/color_scheme: native_light
+  style/color_scheme_dark: native_dark
+
+  style/candidate_list_layout: linear
+  style/text_orientation: horizontal
+  style/inline_preedit: true
+  style/inline_candidate: false
+
+  # 字体留空 = 系统字体（中文字形仍是苹方，与原生输入法一致）
+  style/font_face: ""
+  style/font_point: 16
+  style/label_font_face: ""
+  style/label_font_point: 11
+  style/comment_font_face: ""
+  style/comment_font_point: 12
+  style/candidate_format: "[label] [candidate] [comment]"
+
+  # 自编译版鼠须管的 capsule 模式：内边距不再随圆角膨胀，圆角自动截到半高 = 胶囊
+  style/capsule: true
+  style/corner_radius: 99           # 99 = 始终是胶囊
+  style/hilited_corner_radius: 99
+  style/hilited_inset: 3            # 选中胶囊离面板边缘的距离
+  style/border_height: 5            # 上下留白
+  style/border_width: 9             # 左右留白；选中胶囊内左右留白 = border_width - hilited_inset
+  style/line_spacing: 0
+  style/spacing: 0
+  style/shadow_size: 0
+
+  # 按宽度显示候选（自编译版）：候选条固定宽度，放得下几个显示几个，最多 menu/page_size 个
+  style/max_width: 360
+  # 切换中英文时在光标处弹出蓝色胶囊（自编译版），代替在候选框里显示文字
+  style/status_badge: true
+  style/status_badge_font_point: 12   # 胶囊大小：字号 × 1.6 ≈ 高度
+  style/status_message_type: short
+  style/translucency: true
+  style/material: popover          # 磨砂材质：popover / menu / hud / sidebar / sheet，可自行换着试
+  style/show_paging: false
